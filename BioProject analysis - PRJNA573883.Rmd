@@ -1,0 +1,726 @@
+---
+title: 'BioProject analysis: PRJNA573883 (CardioMyocyte  hESC RNA-seq)'
+author: "Gino Philips"
+date: "20 januari 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Geberal introduction
+
+```{r}
+library("limma")
+library("edgeR")
+library("Glimma")
+library("gplots")
+library("GENIE3")
+library("igraph")
+library("RCy3")
+library("Rgraphviz")
+library("RColorBrewer")
+library("org.Hs.eg.db")
+library("GO.db")
+library("biomaRt")
+```
+
+
+# Load in the data
+
+Load in the meta-data, gene-count table and transcript count table into R. Note: the current files are zipped (see .gz extension, which means a gzip compression)
+
+
+```{r}
+# Metadata
+accessions <- read.csv2("C:/Users/patri/Desktop/2020/Project datasets/GEO datasets/PRJNA573883/SRR_Acc_List.txt", sep = ",", header = FALSE, col.names = "Samples")
+sample_info <- read.csv2("C:/Users/patri/Desktop/2020/Project datasets/GEO datasets/PRJNA573883/SraRunTable.txt", sep = ",")
+
+# Read in both the gene and transcript count matrix in for inspection
+Gene_count_table <- gzfile("C:/Users/patri/Desktop/2020/Project datasets/GEO datasets/PRJNA573883/GSE137920_gene_count_matrix.csv.gz")
+Gene_count_table <- read.csv2(Gene_count_table, sep =",")
+
+Transcript_count_table <- gzfile("C:/Users/patri/Desktop/2020/Project datasets/GEO datasets/PRJNA573883/GSE137920_transcript_count_matrix.csv.gz")
+Transcript_count_table <- read.csv2(Transcript_count_table, sep =",")
+```
+
+
+# Inspect the data
+
+```{r}
+# View the metadata
+sample_info
+
+groups <- factor(sample_info$cell_stage)
+table(groups)
+
+# view the first 10 entries in the gene and transcript counts tables
+head(Gene_count_table, n = 10)
+head(Transcript_count_table, n = 10)
+```
+
+
+From the meta data we can see that there are 12 samples divided into 4 different groups: pluripotent stem-cells, mesoderm stem-cells, early cardiomycyte cells and cardiomyocyte cells. These groups are both divisible in these groups, as well as divisible based on the timepoints when they were collected for sequencing. Time points for each group is 0, 2, 7 or 14 days. Knowing the experimental setup of the experimental data is of importance as later a design matrix based can/needs to be made for an adequate performance of the DE-analysis. 
+
+Note that this metadata contains the data regarding the fastq-files. These are the files that are obtained after the NGS sequencing itself and only contain the raw data (quality scores for each fragment). At this stage they still require quality control QC, which can be dne by using the Fastqc and MultiQC tools, mapping, which for RNA-seq has to be performed against an splice aware mapper e.g.STAR, subsequent filtering of bad reads, through e.g. SAMTOOLS or PICARD. After mapping each read is assigned a feature which finally results in the count data we have here, this can be achieved by using HTSeq. The data here is the raw count table obtained after all these steps.
+
+
+Inspecting both the gene and transcript tables, we can observe features/counts are annotated by ENSEMBL identifiers, ENSG and ENST. Secondly on a first glance we can see that several of these identifiers are not expressed at high leves in any of the samples e.g. ENSG00000282221 (gene) and ENST00000618885 (transcript).
+
+
+These low counts have 2 potential issues during the analysis. 1) They are non-informative, as they are either expressed at very low levels among the samples the samples, or are only expressed in some samples of their respective group. 2) They are believed to shift the amount of DE genes detected in the downstream statistical analysis. As such it is advised that these reads are filtered prior to downstream analysis. Another aspect to consider during this filter is that not all ids might be annotated yet, and one can choose to remove these ids as well. Note however that filtering on annotation might remove relevant (and thus potentially important) genes, as well as alter the final results of DE. (Look for some literature on this, as I am not sure what to do here). A study on the effect of filtering lowly expressed genes for DE can be found [here](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4983442/pdf/nihms-804200.pdf).
+
+
+Lastly we can also observe that the groups are not placed in order. This is important to note as not accounting for this might cause the downstream analysis to be wrong (see the design matrix)
+
+# Annotation
+
+While in many cases the "org.HS.eg.db" package is used for linking the ENSEMBL identifiers to external_gene_name, biomaRt will be used instead to annotate the ID in both count tables. The key reasoning for using biomaRt is that the org.Hs.eg.db annotation seems to remove a rather large amount of IDs. However, this does not mean they are not important to consider. Below the IDs are annotated in the count data matrix prior to filtering and analysis.
+
+
+```{r}
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+annotated_gene_id <- getBM(attributes = c("ensembl_gene_id", "external_gene_name",  "gene_biotype"), filters = "ensembl_gene_id",  values = Gene_count_table$gene_id, mart = ensembl)
+
+annotated_transcript_id <- getBM(attributes = c("ensembl_transcript_id", "external_transcript_name", "transcript_biotype"), filters = "ensembl_transcript_id",  values = Transcript_count_table$transcript_id, mart = ensembl)
+```
+
+```{r}
+print(paste0("Number of genes prior to annotation based filtering ", dim(Gene_count_table)[1]))
+keep_gene <- Gene_count_table$gene_id %in% annotated_gene_id$ensembl_gene_id
+
+Gene_count_table <- Gene_count_table[keep_gene, ]
+print(paste0("Number of genes after annotation based filtering ", dim(Gene_count_table)[1]))
+
+
+print(paste0("Number of transcripts prior to annotation based filtering ", dim(Transcript_count_table)[1]))
+keep_transcript <- Transcript_count_table$transcript_id %in% annotated_transcript_id$ensembl_transcript_id
+
+Transcript_count_table <- Transcript_count_table[keep_transcript, ]
+print(paste0("Number of transcripts after annotation based filtering ", dim(Transcript_count_table)[1]))
+```
+
+Here we see that  560 and 926 ENSEMBL gene and transcript IDs respectively were removed. Also note that the amount of genes far exceeds the expected amount of 20.000 - 25.000, this might be caused by a large fraction of non-coding genes.like lncRNAs to be expressed as well. The choice of performing this method of annotation will however impact the final result of DE genes. The reason being that the start amount of IDs differs and thus is likely to alter downstream analysis in some manner The amount of transcripts is indeed much larger than the expected amount of genes as many genes have many possible transcripts.
+
+
+```{r}
+# Filtering ENSEMBL_ids out the annotation data frame as they migth not be present in the data as well (e.g. have more IDs than in the data) 
+keep_anno_gene <- Gene_count_table$gene_id %in% annotated_gene_id$ensembl_gene_id
+annotated_gene <- annotated_gene_id[keep_anno_gene,]
+
+# A double check to see if the filtering went correctly (dataframe rows should be equal -> using the refseq_mrna ids messes this part up)
+dim(Gene_count_table)
+dim(annotated_gene_id)
+
+Gene_count_table <-Gene_count_table[order(Gene_count_table$gene_id), ]
+annotated_gene <- annotated_gene[order(annotated_gene$ensembl_gene_id), ]
+
+head(Gene_count_table)
+head(annotated_gene)
+
+Gene_count_table$external_gene_name <- annotated_gene$external_gene_name
+Gene_count_table$gene_biotype <- annotated_gene$gene_biotype
+
+head(Gene_count_table)
+
+
+# Filtering ENSEMBL_ids out the annotation data frame as they migth not be present in the data as well (e.g. have more IDs than in the data) 
+keep_anno_trans <- Transcript_count_table$transcript_id %in% annotated_transcript_id$ensembl_transcript_id
+annotated_trans <- annotated_transcript_id[keep_anno_trans,]
+
+# A double check to see if the filtering went correctly (dataframe rows should be equal -> using the refseq_mrna ids messes this part up)
+dim(Transcript_count_table)
+dim(annotated_transcript_id)
+
+Transcript_count_table <-Transcript_count_table[order(Transcript_count_table$transcript_id), ]
+annotated_trans <- annotated_trans[order(annotated_trans$ensembl_transcript_id), ]
+
+head(Transcript_count_table)
+head(annotated_trans)
+
+Transcript_count_table$external_transcript_name <- annotated_trans$external_transcript_name
+Transcript_count_table$transcript_biotype <- annotated_trans$transcript_biotype
+
+head(Transcript_count_table)
+```
+
+
+```{r}
+Biotype_table_gene <- table(Gene_count_table$gene_biotype)
+Biotype_table_gene
+pie(as.vector(Biotype_table_gene), labels = names(Biotype_table_gene), main = "Pie-chart of the different gene biotypes in the count table")
+
+
+Biotype_table_trans <- table(Transcript_count_table$transcript_biotype)
+Biotype_table_trans
+pie(as.vector(Biotype_table_trans), labels = names(Biotype_table_trans), main = "Pie-chart of the different transcript biotypes in the count table")
+```
+
+
+Looking into the fractions of the different biotypes we observe that the majority of counts can be attributed to protein coding RNAs, lncRNAs and processed_pseudogenes. While the expression of protein coding coding genes and lncRNAs is expected, the high percentage of processed pseudogenes is not (in my opinion). It is possible that all of these are are wrong mappings of of true protein coding genes, yet are closely related to pseudogenes. (What are processsed pseudogenes? -> literature)
+
+
+## Design
+
+Before we go to the filtering step we can setup a design matrix. A design matrix is a matrix that describes which sample belongs two which group and is a very important aspect when comparing groups to each other. In this case the a design matrix is actually not required, yet for more complex experimental setups this approach is invaluable. The reason forwhy it is less an issue to drop it this case is that there are 4 time points (0, 2, 7 and 14), that each result in one of the cell-stages. However, not of these stages have a different factor that  separates them from each other apart from the time-points. 
+
+If for example we had double the amount of samples, but at each time-point there is a different treatment applied among the groups we can make comparison based on both time-point and treatment. At the moment this is the case a design matrix is warranted, as well as the simplest approach, the exact test (which uses a conditional quantitative liklihood ratio test cQLRT), becomes unsuitable to handle this. 
+
+For both the gene and transcript tables the design remains the same. Also as the differentiation is always in order the following comparisons make the most sense to perform: Pluripotent vs. Mesoderom, Mesoderm vs. Early_cardiomyocyte and Early_cardiomyocyte vs. Cardiomyocyte.
+
+
+```{r}
+# a zero offset model will be made 
+design <- model.matrix(~0+groups)
+colnames(design) <- levels(groups)
+design
+```
+
+## Filtering:
+
+The first step is to convert the data table into a DGEList (the object that EdgeR uses to run the analysis). Alternatively one can use DESeq2 object. In case a limma-voom aproach is to be used one will start from this data and log2-transform the data for downstream analysis.
+
+
+```{r}
+# Convert data to DGELIst using the metadata grouping information
+y_gene <- DGEList(counts = Gene_count_table[, c(2:4,8:13,5:7)], genes = Gene_count_table[, c(1,14, 15)], samples = sample_info[,1], group = factor(sample_info[,8]))
+
+head(y_gene$counts)
+head(y_gene$genes)
+y_gene$samples
+
+
+y_transcripts <- DGEList(counts = Transcript_count_table[, c(2:4,8:13,5:7)], genes = Transcript_count_table[, c(1,14, 15)], samples = sample_info[,1], group = factor(sample_info[,8]))
+
+head(y_transcripts$counts)
+head(y_transcripts$genes)
+y_transcripts$samples
+```
+
+
+This can be done using the EdgeR function filterByExpr() or done manually. Here I compare both approaches (I believe the EdgeR method to be the best option, especially because this method is tested and used very extensively)
+
+```{r}
+# Set up a sufficient treshold to filter the samples
+
+# create a boolean list telling wether a value is above or below the given treshold (A value of 0.5 cpm, which is the treshold, is a rather arbitrarilly chosen value). Additionally the gene needs to be expressed in either 2 of the 3 samples (or all). Personally I think the later is likely to be a better choice.
+
+treshold_gene <- cpm(y_gene$counts) > 0.5 # 0.5 as cpm treshold and 3 as each group has 3 samples in which the gen is required to be expressed
+keep1_gene <- rowSums(treshold_gene) >= 3
+y_gene_manual_filter <- y_gene$counts[keep1_gene, ]
+
+# Using filterByExpr using default options
+keep2_gene <- filterByExpr(y_gene)
+y_gene_edgey_filter <- y_gene$counts[keep2_gene,]
+
+dim(y_gene$counts)
+dim(y_gene_manual_filter)
+dim(y_gene_edgey_filter)
+
+
+
+treshold_trans <- cpm(y_transcripts$counts) > 0.5 # 0.5 as cpm treshold and 3 as each group has 3 samples in which the gen is required to be expressed
+keep1_trans <- rowSums(treshold_trans) >= 3
+y_trans_manual_filter <- y_transcripts$counts[keep1_trans, ]
+
+# Using filterByExpr using default options
+keep2_trans <- filterByExpr(y_transcripts)
+y_trans_edgey_filter <- y_transcripts$counts[keep2_trans,]
+
+dim(y_transcripts$counts)
+dim(y_trans_manual_filter)
+dim(y_trans_edgey_filter)
+```
+
+
+As we can observe the EdgeR method filtered out less genes compared to the manual approach. We will check if the same genes are retained in the manual approach or not. Also note that the dimension of the original and EdgeR frame exceeds the amount of human protein genes (which is determined to be somewhere in between 20.000 and 25.000). This is because a lot of non-coding RNAs that are expressed are also captured during the RNA-seq process. 
+
+
+```{r}
+head(y_gene_manual_filter, n = 10)
+head(y_gene_edgey_filter, n = 10)
+
+# All genes retained in the manual approach, were retained in the edgeR method also.
+length(rownames(y_gene_manual_filter) %in% rownames(y_gene_edgey_filter))
+```
+
+
+In the above table we observe that in the edgeR method genes expressed only in some groups are retained while in the manual method this does not appear to be the case. How to solve this in a manual manner (I still do not understand the way to approach this in a programming manner)?
+
+
+```{r}
+# We choose to use the EdgeR filtering method for further downstream analysis. Plus we need to readjust the the lib.sizes for each sample as
+# Although some sources claim this is usually not that impactfull on the downstream analysis.
+
+y_gene$counts <- y_gene$counts[keep2_gene,]
+y_gene$samples$lib.size <- colSums(y_gene$counts)
+
+y_transcripts$counts <- y_transcripts$counts[keep2_trans,]
+y_transcripts$samples$lib.size <- colSums(y_transcripts$counts)
+```
+
+
+It seems that only a few ENSEMBL IDs remain unannotated after querying the biomaRt database. Among the IDs there are lot of protein coding genes, yet there are also numerous processed pseudogenes, lncRNAs,snoRNA, Mt_rRNA, rRNA, ribozyme, Mt_tRNA, snRNA, scaRNA, etc... Some of these, like the rRNAs and tRNAs might not be usefull in the long run and are usually filtered out (or so do I think). I do not know if the org.Hs.eg.db method only retains the protein coding genes or not.
+
+On a final note regarding the normalization. By performing the TMM the data is normalized for both sequencing depth and RNA-composition among all samples. Unlike in microarrays there is no need to correct for GC-content in the RNA-samples, as this is believed to have little to no effect on the differential expression analysis itself. There are however studies that claim that GC-content causes sample-specific effects, packages like EDAseq and cqn can be used to adjust the correction for these factors.
+
+Similar to GC-content, gene-lenght is believed not to have an impact on DE-analysis and thus is not corrected for in EdgeR. The effect of gene length is particularlly of interest when investigating the RNA-composition in technical replicates.
+
+
+
+```{r}
+row_names <- rownames(y_gene$counts)
+y_gene$genes <- y_gene$genes[row_names, ]
+dim(y_gene$genes)
+
+
+Biotype_table_filtered <- table(y_gene$gene[, 3])
+Biotype_table_filtered
+as.vector(Biotype_table_filtered)
+pie(as.vector(Biotype_table_filtered), labels = names(Biotype_table_filtered), main = "Pie-chart of the different gene biotypes in the count table")
+
+
+row_names <- rownames(y_transcripts$counts)
+y_transcripts$genes <- y_transcripts$genes[row_names, ]
+dim(y_transcripts$genes)
+
+
+Biotype_table_filtered <- table(y_transcripts$gene[, 3])
+Biotype_table_filtered
+as.vector(Biotype_table_filtered)
+pie(as.vector(Biotype_table_filtered), labels = names(Biotype_table_filtered), main = "Pie-chart of the different transcript biotypes in the count table")
+```
+
+
+After filtering we can see that over half of the reads are attributed to protein coding RNAs followed by lncRNAs. Also note that the large fraction attributed to the processed pseudogenes is reduced considerably. 
+
+
+# Modelling and analysing the data
+
+
+Now that we have filtered the count data (on the both expression (and annotation)), adjusted the library sizes we can start with the downstream analysis. The count data among the different samples can now reveal if there are any differentially expressed (DE) genes present among the different groups. In EdgeR this is performed by estimating the dispersion values of each gene in each sample and testing for significant differences. For this we can continue using EdgeR, where we will use either an exact-test or a generalized linear model (glm) approach. Alternatively we can log2-transform the count data an analyze the RNA-seq data if it were microarray data using either the limma-trend or limma-voom approach. Which approach used depends on how consistent the sequencing depth between the samples is.
+
+Here we will first perform the EdgeR approach and afterwards we will make a comparison with the limma-voom approach.
+
+
+```{r}
+y_gene$samples
+```
+
+
+Looking at the samples we can observe that each sample has a different library size (the total amount of mapped reads in each sample). This means that the sequence depth in each sample is very likely to differ from those in the other samples. To acount for this we need to perform a normalization using the EdgeR calcNorm function.
+
+
+# Perform the count normalization
+
+In EdgeR, count normalization is performed by a method called the Trimmed Mean of M-values, TMM. In this method one sample is randomly taken as a reference and M-values for each gene to another is calculated. In the end a mean-value is determined over the M-values and assigned to the sample in question. During this process extreme M-values and M-values of highly expressed genes are not considered, meaning that both outliers and truly DE genes(In the latter one only a small fraction of the thousands of gene might take up the most of the total library size). This normalization assumes that the majority of genes are not DE.  
+
+This normalization is calculated using the calcNormFactors() function in EdgeR and can take a design matrix if required.
+
+
+```{r}
+y_gene <- calcNormFactors(y_gene)
+y_gene$samples
+
+y_transcripts <- calcNormFactors(y_transcripts)
+y_transcripts$samples
+```
+
+
+Next we can explore the data somewhat further to see if there is any grouping observable in the data itself. A first step is to perform a Multidimensional scaling plot. The norm factors are the M-values calculated as explained in the previous step. (I still need to recheck how the norm.factors impact the resulting counts for each gene.)
+
+
+Based on the counts we can perform a plot to see if each sample within a group tends to cluster to members of its group. This can be achieved using either a Principal Component Analysis (PCA) or MultiDimensional Scaling (MDS).Alternatively t-distributed Stochastic Neighbour Embedding (t-SNE) could be considered as well. Below we will plot this clustering using the plotMDS function included in the limma library, which was originally designed for microarray analysisand later extended for use on RNA-seq as well.
+
+
+```{r}
+AveLogCPM <- aveLogCPM(y_gene)
+hist(AveLogCPM)
+
+AveLogCPM <- aveLogCPM(y_transcripts)
+hist(AveLogCPM)
+```
+
+The plot of the gene log count per million histogram looks to be bimodal in nature (Is this okay?), while the transcript histogram is unimodal but skewed.
+
+
+```{r}
+# MDSplot gene counts
+pch <- c(0,1,2,3)
+colors <- rep(c("red", "blue", "green", "black"), 3)
+plotMDS(y_gene, col = colors[groups], pch = pch[groups])
+legend("topleft", legend = levels(groups), pch = pch, col = colors, ncol = 2)
+
+
+# MDSplot transcripts counts
+pch <- c(0,1,2,3)
+colors <- rep(c("red", "blue", "green", "black"), 3)
+plotMDS(y_transcripts, col = colors[groups], pch = pch[groups])
+legend("topleft", legend = levels(groups), pch = pch, col = colors, ncol = 2)
+
+
+# MDplots gene counts
+plotMD(y_gene, column = 1)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_gene, column = 2)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_gene, column = 3)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_gene, column = 4)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_gene, column = 5)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_gene, column = 6)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_gene, column = 7)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_gene, column = 8)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_gene, column = 9)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_gene, column = 10)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_gene, column = 11)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_gene, column = 12)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+
+# MDplots transcript counts
+plotMD(y_transcripts, column = 1)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_transcripts, column = 2)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_transcripts, column = 3)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_transcripts, column = 4)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_transcripts, column = 5)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_transcripts, column = 6)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_transcripts, column = 7)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_transcripts, column = 8)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_transcripts, column = 9)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_transcripts, column = 10)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_transcripts, column = 11)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+
+plotMD(y_transcripts, column = 12)
+abline(h=0, col = "red", lty = 2, lwd = 2)
+```
+
+
+Next an estimate of the dispersion is made. This estimate is required as the count data in RNA-seq is mostly, if not always described as an overdispersed Poisson distribution. The model used to describe this overdispersion is called a negative binomial distribution (NB), which edgeR fits onto the data.
+
+
+```{r}
+# The robust factor makes the estimate more ribust to potential outliers (highly expressed genes)
+y_gene <- estimateDisp(y_gene, design, robust= TRUE)
+
+# The common dispersion over all genes 
+y_gene$common.dispersion
+
+# This true biological variation (BCV)
+sqrt(y_gene$common.dispersion)
+
+# The trended dispersion over the genes
+head(y_gene$trended.dispersion)
+
+# The gene (Tagwise) dispersion for each gene
+head(y_gene$tagwise.dispersion)
+
+
+
+# The same for the transcripts
+y_transcripts <- estimateDisp(y_transcripts, design, robust= TRUE)
+
+# The common dispersion over all transcripts 
+y_transcripts$common.dispersion
+
+# This true biological variation (BCV)
+sqrt(y_transcripts$common.dispersion)
+
+# The trended dispersion over the transcripts
+head(y_transcripts$trended.dispersion)
+
+# The gene (Tagwise) dispersion for each gene
+head(y_transcripts$tagwise.dispersion)
+```
+
+
+```{r}
+plotBCV(y_gene)
+plotBCV(y_transcripts)
+```
+
+
+```{r}
+# Fitting a negative binomial on the the distribution of counts
+fit_gene <- glmQLFit(y_gene, design, robust = TRUE)
+plotQLDisp(fit_gene)
+head(fit_gene$coefficients)
+summary(fit_gene$df.prior)
+
+
+fit_trans <- glmQLFit(y_transcripts, design, robust = TRUE)
+plotQLDisp(fit_trans)
+head(fit_trans$coefficients)
+summary(fit_trans$df.prior)
+```
+
+The QL approach squeezes the raw QL dispersion estimates toward a global trend. This moderation reduces the uncertainty of the estimates and improves the power of testing. The extent of the of the squeezing procedure is goverened by the value of the df priors estimated. Large priors estimates indicate that the QL dispersion is less variable between the genes, smaller priors indicate that the true unknown dispersions are highly variable. Indication of high priors is a sign strong moderation should be performed, low priors suggest weaker moderation is appropriate.
+
+Make contrasts to compare each group one-to-one, as well as a contrast to perform a one-way analysis of deviance
+
+```{r}
+
+MvsP <- makeContrasts(mesoderm-pluripotent, levels = design)
+EvsM <- makeContrasts(early_cardiomyocyte-mesoderm, levels = design)
+CvsE <- makeContrasts(cardiomyocyte-early_cardiomyocyte, levels = design)
+contr <- makeContrasts(MvsP = mesoderm-pluripotent, EvsM = early_cardiomyocyte-mesoderm, CvsE = cardiomyocyte-early_cardiomyocyte, levels = design)
+```
+
+
+Below we perform a glmQLTest for each of the 3 comparisons: Mesoderm vs Pluripotent, Early cardiomyocytes vs Mesoderm and Cardiomyocyte vs early cardiomyocyte
+
+```{r}
+meso_pluri <- glmQLFTest(fit_gene, contrast = MvsP)
+topTags(meso_pluri, n = 25)
+summary(decideTests(meso_pluri, lfc = 2))
+plotMD(meso_pluri)
+abline(h = c(-2,2), col = "blue")
+
+early_meso <- glmQLFTest(fit_gene, contrast = EvsM)
+topTags(early_meso, n = 25)
+summary(decideTests(early_meso, lfc = 2))
+plotMD(early_meso)
+abline(h = c(-2,2), col = "blue")
+
+card_early <- glmQLFTest(fit_gene, contrast = CvsE)
+topTags(card_early, n = 25)
+summary(decideTests(card_early, lfc = 2))
+plotMD(card_early)
+abline(h = c(-2,2), col = "blue")
+
+
+
+# Transcripts
+meso_pluri_trans <- glmQLFTest(fit_trans, contrast = MvsP)
+topTags(meso_pluri_trans, n = 25)
+summary(decideTests(meso_pluri_trans, lfc = 2))
+plotMD(meso_pluri_trans)
+abline(h = c(-2,2), col = "blue")
+
+early_meso_trans <- glmQLFTest(fit_trans, contrast = EvsM)
+topTags(early_meso_trans, n = 25)
+summary(decideTests(early_meso_trans, lfc = 2))
+plotMD(early_meso_trans)
+abline(h = c(-2,2), col = "blue")
+
+card_early_trans <- glmQLFTest(fit_trans, contrast = CvsE)
+topTags(card_early_trans, n = 25)
+summary(decideTests(card_early_trans, lfc = 2))
+plotMD(card_early_trans)
+abline(h = c(-2,2), col = "blue")
+```
+
+```{r}
+meso_pluri_treat <- glmTreat(fit_gene, contrast = MvsP, lfc = log2(2))
+topTags(meso_pluri_treat, n = 500, sort.by = "PValue")
+summary(decideTests(meso_pluri_treat))
+plotMD(meso_pluri_treat)
+abline(h = c(-2,2), col = "blue")
+
+early_meso_treat <- glmTreat(fit_gene, contrast = EvsM, lfc = log2(2))
+topTags(early_meso_treat, n = 500, sort.by = "PValue")
+summary(decideTests(early_meso_treat))
+plotMD(early_meso_treat)
+abline(h = c(-2,2), col = "blue")
+
+card_early_treat <- glmTreat(fit_gene, contrast = CvsE, log1(2))
+topTags(card_early_treat, n = 500, sort.by = "PValue")
+summary(decideTests(card_early_treat))
+plotMD(card_early_treat)
+abline(h = c(-2,2), col = "blue")
+
+
+
+# Transcripts_Treat
+meso_pluri_trans_treat <- glmTreat(fit_trans, contrast = MvsP)
+topTags(meso_pluri_trans_treat, n = 500, sort.by = "PValue")
+summary(decideTests(meso_pluri_trans_treat, lfc = 2))
+plotMD(meso_pluri_trans_treat)
+abline(h = c(-2,2), col = "blue")
+
+early_meso_trans_treat <- glmTreat(fit_trans, contrast = EvsM)
+topTags(early_meso_trans_treat, n = 25)
+summary(decideTests(early_meso_trans_treat, lfc = 2))
+plotMD(early_meso_trans_treat)
+abline(h = c(-2,2), col = "blue")
+
+card_early_trans_treat <- glmTreat(fit_trans, contrast = CvsE)
+topTags(card_early_trans_treat, n = 25)
+summary(decideTests(card_early_trans_treat, lfc = 2))
+plotMD(card_early_trans_treat)
+abline(h = c(-2,2), col = "blue")
+```
+
+
+# Heatmap clustering
+
+```{r}
+
+# logCPM is also used in the limma-trand and limma-voom approach
+logCPM <- cpm(y_gene, prior.count = 2, log = TRUE)
+rownames(logCPM) <- y_gene$genes$external_gene_name
+colnames(logCPM) <- paste(y_gene$samples$group, 1:3, sep = "_")
+
+o <- order(early_meso_treat$table$PValue)
+logCPM <- logCPM[o[1:100], ]
+
+#coolmap(logCPM, margins = c(7,7), lhei = c(1,15), lwid = c(1,4))
+```
+
+
+# Perform a Gene Ontology pathway analysis
+```{r}
+go_meso_pluri_treat <- goana(meso_pluri_treat, species = "Hs")
+topgo_general_meso_pluri_treat <- topGO(go_meso_pluri_treat, n = 20)
+topgo_sort_up_meso_pluri_treat <- topGO(go_meso_pluri_treat, n = 20, sort = "up")
+topgo_sort_down_meso_pluri_treat <- topGO(go_meso_pluri_treat, n = 20, sort = "down")
+
+go_early_meso_treat <- goana(early_meso_treat, species = "Hs")
+topgo_general_early_meso_treat <- topGO(go_early_meso_treat, n = 20)
+topgo_sort_up_early_meso_treat <- topGO(go_early_meso_treat, n = 20, sort = "up")
+topgo_sort_down_early_meso_treat <- topGO(go_early_meso_treat, n = 20, sort = "down")
+
+go_card_early_treat <- goana(card_early_treat, species = "Hs")
+topgo_general_card_early_treat <- topGO(go_card_early_treat, n = 20)
+topgo_sort_up_card_early_treat <- topGO(go_card_early_treat, n = 20, sort = "up")
+topgo_sort_down_card_early_treat <- topGO(go_card_early_treat, n = 20, sort = "down")
+```
+
+
+```{r}
+topgo_general_meso_pluri_treat
+topgo_general_early_meso_treat
+topgo_general_card_early_treat
+
+topgo_sort_up_meso_pluri_treat
+topgo_sort_up_early_meso_treat
+topgo_sort_up_card_early_treat
+
+topgo_sort_down_meso_pluri_treat
+topgo_sort_down_early_meso_treat
+topgo_sort_down_card_early_treat
+```
+
+
+# Perform a KEGG pathway analysis
+```{r}
+keg_meso_pluri_treat <- kegga(meso_pluri_treat, species = "Hs")
+topkegg_general_meso_pluri_treat <- topKEGG(keg_meso_pluri_treat, n = 20)
+topkegg_sort_up_meso_pluri_treat <- topKEGG(keg_meso_pluri_treat, n = 20, sort = "up")
+topkegg_sort_down_meso_pluri_treat <- topKEGG(keg_meso_pluri_treat, n = 20, sort = "down")
+
+keg_early_meso_treat <- kegga(early_meso_treat, species = "Hs")
+topkegg_general_early_meso_treat <- topKEGG(keg_early_meso_treat, n = 20)
+topkegg_sort_up_early_meso_treat <- topKEGG(keg_early_meso_treat, n = 20, sort = "up")
+topkegg_sort_down_early_meso_treat <- topKEGG(keg_early_meso_treat, n = 20, sort = "down")
+
+keg_card_early_treat <- kegga(card_early_treat, species = "Hs")
+topkegg_general_card_early_treat <- topKEGG(keg_card_early_treat, n = 20)
+topkegg_sort_up_card_early_treat <- topKEGG(keg_card_early_treat, n = 20, sort = "up")
+topkegg_sort_down_card_early_treat <- topKEGG(keg_card_early_treat, n = 20, sort = "down")
+```
+
+
+```{r}
+topkegg_general_meso_pluri_treat
+topkegg_general_early_meso_treat
+topkegg_general_card_early_treat
+
+topkegg_sort_up_meso_pluri_treat
+topkegg_sort_up_early_meso_treat
+topkegg_sort_up_card_early_treat
+
+topkegg_sort_down_meso_pluri_treat
+topkegg_sort_down_early_meso_treat
+topkegg_sort_down_card_early_treat
+```
+
+
+# Fry gene set tests
+```{r}
+signi.go <- c("GO:0003013", "GO:0008015", "GO:0030262", "GO:0048871")
+term <- select(GO.db, keys = signi.go, columns = "TERM")
+term
+```
+
+
+
+```{r}
+Rkeys(org.Hs.egGO2ALLEGS) <- signi.go
+signi.go.genes <- as.list(org.Hs.egGO2ALLEGS)
+```
+
+
+```{r}
+fry(y_gene, index=signi.go.genes, design = design, contrast = MvsP)
+```
+
+```{r}
+
+index <- rownames(fit_gene$genes) %in% signi.go.genes[[3]]
+barcodeplot(meso_pluri_treat$table$logFC , index = index, labels = c("pluripotent", "mesoderm"), main = signi.go[3])
+```
+
+
+```{r}
+load(url("http://bioinf.wehi.edu.au/software/MSigDB/human_c2_v5p2.rdata")) # Loads in as Hs.c2
+```
+
+
+```{r}
+idx <- ids2indices(Hs.c2, id = rownames(y_gene))
+```
+
+
+```{r}
+cam <- camera(y_gene, idx, design, contrast = MvsP, inter.gene.cor = 0.01)
+options(digits = 2)
+head(cam, 14)
+```
+
+
+```{r}
+barcodeplot(meso_pluri_treat$table$logFC , index = idx[["REACTOME_PROSTANOID_LIGAND_RECEPTORS"]], labels = c("pluripotent", "mesoderm"), main = "REACTOME_PROSTANOID_LIGAND_RECEPTORS", alpha = 1)
+```
